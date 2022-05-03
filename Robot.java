@@ -1,14 +1,32 @@
 package frc.robot;
 
-// https://github.com/CrossTheRoadElec/Phoenix-Examples-Languages/tree/master/Java%20Talon%20FX%20(Falcon%20500)
+/**
+ * auto tune PID controller
+ * 
+ * All dependencies on the motor, motor controller, and gearing are gathers in config Flywheel.
+ * Make a new version of that method for each combination of motor, motor controller, and gearing.
+ * 
+ * Run the code in TeleOperated Enable until the motors stop - tuning has completed - then Disable
+ * 
+ * Change to Autonomous and Enable to run the PIDF values.  Disable to stop motor.
+ * 
+ * 
+ * improvements could include setting battery voltage compensation to say 11 or 12 volts. More reproducible but slower response the lower the voltage.
+ *
+ * https://github.com/CrossTheRoadElec/Phoenix-Examples-Languages/tree/master/Java%20Talon%20FX%20(Falcon%20500)
+*/
 
-// auto tune PID controller
-// coding heavily depends on speed being -1 to +1 -- %VBus and Talon native velocity units encoder ticks/100 ms
-// also built-in 1 ms Talon differentiator/integrator period and 1023 throttle units max voltage
-
-// changes could include setting battery voltage compensation to say 11 or 12 volts. More reproducible but slower response the lower the voltage.
-
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Supplier;
+
+import edu.wpi.first.wpilibj.TimedRobot;
+import edu.wpi.first.wpilibj.Timer;
+import edu.wpi.first.wpilibj.livewindow.LiveWindow;
+import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
+import frc.robot.PID_ATune.CONTROL_TYPE;
+import frc.robot.PID_ATune.DIRECTION;
 
 import com.ctre.phoenix.ParamEnum;
 import com.ctre.phoenix.motorcontrol.ControlMode;
@@ -21,85 +39,91 @@ import com.ctre.phoenix.motorcontrol.can.TalonSRX;
 import com.ctre.phoenix.motorcontrol.can.TalonSRXConfiguration;
 import com.ctre.phoenix.sensors.SensorVelocityMeasPeriod;
 
-import edu.wpi.first.wpilibj.TimedRobot;
-import edu.wpi.first.wpilibj.Timer;
-import edu.wpi.first.wpilibj.livewindow.LiveWindow;
-import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
-import frc.robot.PID_ATune.CONTROL_TYPE;
-import frc.robot.PID_ATune.DIRECTION;
-
 public class Robot extends TimedRobot {
-  private static final int sampleTime = 5; // milliseconds loop sample time period
-  private static final int TIMEOUT_MS = 30;
-  // stubs for unit conversions
-  Supplier<Double> getFlywheelSpeed;
-  double KuUnitsConversion;
-  double PuUnitsConversion;
+
+  // private static TalonFX flywheelMotor; //FIXME:
+  private static TalonSRX flywheelMotor; //FIXME:
+  /*milliseconds*/ private static final int sampleTime = 5; // milliseconds loop sample time period
+  /*milliseconds*/ private static final int TIMEOUT_MS = 30;
   
-  // private static TalonFX flywheelMotor;
-  private static TalonSRX flywheelMotor;
-  
-  double RPM_per_VelocityUnit;
+  double engineeringVelocityUnit;
  
   private PID_ATune tuner;
-  private long millisStart;
-  // control (output) signal limits
-  double controllerMin = 0., controllerMax = 1.; // FIXME
-  // double controllerMin = -1., controllerMax = 1.;
-  double output= 0.30; // center of the relay pulse %vBus for Talon FIXME
-  double oStep = 0.15; // + and - step size for the output perturbation (relay)
-  double setpoint; // below we'll find out the velocity we get for the output signal specified above [native units]
-  // leave everything (almost) in native units so no conversion required
-  boolean tuning = true;
+  /*milliseconds*/ private long tunerStartTime;
+  double controlSignalStop; // stop motor
+  double controlSignal; // center of the relay pulse
+  double oStep; // + and - step size for the controlSignal perturbation (relay)
+  double minPctVBus;
+  double maxPctVBus;
+  BiConsumer<Double, Double> printSpeed;
+  Consumer<Double> setFlywheelControlSignal;
+  Runnable printAndClearIntegrator;
+  Runnable setPIDFvalues;
+  double setpoint; // velocity we get for the control signal
+  boolean tuning;
+  Supplier<Double> getFlywheelSpeed;
+  Supplier<Double> getMotorOutput;
+  Function<Double, Double> setFlywheelVelocity;
+  double KuUnitsConversion;
+  double PuUnitsConversion;
 
-  int pidIdx = 0; // Talon primary closed loop control
-  int slotIdx = 0; // Talon index to select which set of k's to use
+  final int pidIdx = 0; // Talon primary closed loop control
+  final int slotIdx = 0; // Talon index to select which set of k's to use
   double[] kP = new double[4];
   double[] kI = new double[4];
   double[] kD = new double[4];
   double[] kF = new double[4];
+  double kFtuner;
 
   StripChart myChart;
-
-  RunningRegression aLine = new RunningRegression(); // construct regression object used for calculating kF
 
   double flipNearZero = Double.MIN_NORMAL; // trick for the SmartDashboard line plot
 
   Robot()
   {
     super((double)sampleTime/1000.); // set the robot loop time
-    LiveWindow.disableAllTelemetry();
+    LiveWindow.disableAllTelemetry(); // don't waste time on stuff we don't need
   }
 
   @Override
   public void robotInit()
   {
-    configFlywheelMotor(); //FIXME: uncomment the right one and comment out all the others
+    configFlywheel(); //FIXME: uncomment the right one and comment out all the others
   }
 
   @Override
   public void teleopInit() {
 
-    kF[slotIdx] = 0.96*computeKf(); // reduce the full kF a little - close for a flywheel but gives the controller a little room to control
-    
-    stabilizeInitialSpeed();
+    System.out.println("Start auto tuning PIDF");
+    tuning = true;
 
-    tuner = new PID_ATune( setpoint, output, oStep, DIRECTION.DIRECT, CONTROL_TYPE.PID_CONTROL, sampleTime );
+    System.out.println("Start computing kF");
+    kFtuner = computeKf(minPctVBus, maxPctVBus);
+    
+    System.out.println("Stabilize tuning center speed");
+    setpoint = stabilizeInitialSpeed(controlSignal);
+    System.out.println(" control signal " + controlSignal + ", control signal step +- " + oStep + ", average velocity " + setpoint);
+
+    tuner = new PID_ATune( setpoint, controlSignal, oStep, DIRECTION.DIRECT, CONTROL_TYPE.PID_CONTROL, sampleTime );
     
     //   S E T U P   S T R I P C H A R T   T O   D I S P L A Y   A C T I O N S
     // center of left process variable graph; minimum value of right controller graph; maximum value of right controller graph
-    myChart = new StripChart( setpoint,	output-oStep,	output+oStep );
+    myChart = new StripChart( setpoint,	controlSignal-oStep,	controlSignal+oStep );
 
-    millisStart = System.currentTimeMillis(); // start time now will be relative 0;
+    System.out.println("Activate relay stepping");
+    tunerStartTime = System.currentTimeMillis(); // tuner time now will be relative 0;
   }
 
   @Override
   public void teleopPeriodic()
   {
-    if(!tuning) return;
+    if(!tuning)
+    {
+      return;
+    }
 
-      double speed = getFlywheelSpeed.get(); // get the speed of the current output
-      int loopStartTime = (int)(System.currentTimeMillis() - millisStart);
+      double speed = getFlywheelSpeed.get(); // get the speed of the current control signal
+      int loopStartTime = (int)(System.currentTimeMillis() - tunerStartTime);
       int rc = tuner.Runtime( speed, loopStartTime );
       // 0 still looking for peaks
       // 1 stop - didn't find peaks; give up; or okay - peaks found and tuned
@@ -112,7 +136,7 @@ public class Robot extends TimedRobot {
       case 1:  // tuning just completed; mark that event, print the peak, and move on
         tuning = false;
       case 3:  // time step okay, print the peak, and process time step
-        System.out.format("  peaks %d-%d, Ku=%.5f, Pu=%.5f, Kp=%.5f, Ki=%.5f, Kd=%.5f %%VBus/velocity\n", 
+        System.out.format("  peaks %d-%d, Ku=%.5f, Pu=%.5f, Kp=%.5f, Ki=%.5f, Kd=%.5f\n", 
           (int)(1000.*tuner.GetPeak_1()), (int)(1000.*tuner.GetPeak_2()), tuner.GetKu(), tuner.GetPu(), tuner.GetKp(), tuner.GetKi(), tuner.GetKd());
 
         // Ku ultimate gain of the controller - units of process input/process output
@@ -121,7 +145,8 @@ public class Robot extends TimedRobot {
 				kP[slotIdx] = tuner.GetKp() * KuUnitsConversion;
 				kI[slotIdx] = tuner.GetKi() * KuUnitsConversion/PuUnitsConversion;
 				kD[slotIdx] = tuner.GetKd() * KuUnitsConversion*PuUnitsConversion;
-				System.out.println("[Talon] PID " + slotIdx + ", Kp = " + kP[slotIdx] + ", Ki = " + kI[slotIdx] + ", Kd = " + kD[slotIdx] + ", kF = " + kF[slotIdx] + "\n");
+        kF[slotIdx] = kFtuner * KuUnitsConversion;  // use 100% of kF for a flywheel
+				System.out.println("[PIDF] " + slotIdx + ", Kp = " + kP[slotIdx] + ", Ki = " + kI[slotIdx] + ", Kd = " + kD[slotIdx] + ", kF = " + kF[slotIdx] + "\n");
       case 0:  // time step okay, process time step
         break;
       case 2:  // too fast, skipping this step
@@ -130,53 +155,54 @@ public class Robot extends TimedRobot {
         System.err.println("\n\nUnknown return from Runtime()\n\n");
       }
 
-      output = tuner.getOutput(); // get the new output
-      setFlywheelSpeed(output); // set a new speed using the new output
+      controlSignal = tuner.getOutput(); // get the new control signal
+      setFlywheelControlSignal.accept(controlSignal); // set a new speed using the new control signal
 
-      // time in milliseconds;	process output variable velocity /\/\/\/\;	process input such as %VBus - the step function _-_-_-_-
-      System.out.print("\n" + myChart.PrintStripChart( loopStartTime,	speed, output ) );
+      // time in milliseconds;	process output variable velocity /\/\/\/\;	process input (control signal) - the step function _-_-_-_-
+      System.out.print("\n" + myChart.PrintStripChart( loopStartTime,	speed, controlSignal ) );
       SmartDashboard.putNumber("speed", speed);
 
       if(!tuning)
       {
-        setFlywheelSpeed(0.); // stop
+        setFlywheelControlSignal.accept(controlSignalStop); // stop
       }
   }      
 
   @Override
   public void disabledInit()
   {
-    // not sure if clear needed in this version - was needed in some previous circumstances
-    System.out.println("[Talon] get kI accum " + flywheelMotor.getIntegralAccumulator(pidIdx));
-    System.out.println("[Talon] clear kI accum " + flywheelMotor.setIntegralAccumulator(0., pidIdx, TIMEOUT_MS));
+    printAndClearIntegrator.run();
   }
 
   @Override
   public void autonomousInit()
   {
-    // set the Talon PID constants calculated during teleop
-    flywheelMotor.selectProfileSlot(slotIdx, pidIdx);
-
-    System.out.println("[Talon] set kF " + flywheelMotor.config_kF(0, kF[slotIdx], TIMEOUT_MS));
-    System.out.println("[Talon] set kP " + flywheelMotor.config_kP(0, kP[slotIdx], TIMEOUT_MS));
-    System.out.println("[Talon] set kI " + flywheelMotor.config_kI(0, kI[slotIdx], TIMEOUT_MS));
-    System.out.println("[Talon] set kD " + flywheelMotor.config_kD(0, kD[slotIdx], TIMEOUT_MS));
+    setPIDFvalues.run(); // set the PIDF constants calculated during teleop
   }
   
+  /**
+   * Run the motor with the PIDF values calculated in teleOp
+   */
   @Override
   public void autonomousPeriodic()
   {
-    // run the motor with PID control
-    flywheelMotor.set(TalonSRXControlMode.Velocity, setpoint);
-    var d = flywheelMotor.getClosedLoopError(pidIdx)*RPM_per_VelocityUnit;
-    var s = getFlywheelSpeed.get()*RPM_per_VelocityUnit;
-    System.out.println("setpoint RPM " + setpoint*RPM_per_VelocityUnit + ", actual RPM " + s + ", error RPM " + d);
-    SmartDashboard.putNumber("RPM", s);
-    SmartDashboard.putNumber("%VBus", flywheelMotor.getMotorOutputPercent());
-    SmartDashboard.putNumber("RPM error", d==0?(flipNearZero=-flipNearZero):d); // trick SmartDashboard plot into thinking value is changing if 0
+    // run the motor with PID control and view results
+    var d = setFlywheelVelocity.apply(setpoint); // sets velocity and returns current velocity error
+    var s = getFlywheelSpeed.get(); // current velocity
+
+    // display this stuff in RPM
+    d *= engineeringVelocityUnit;
+    s *= engineeringVelocityUnit;
+    var sp = setpoint*engineeringVelocityUnit;
+
+    System.out.println("Engineering: setpoint " + sp + ", actual " + s + ", error " + d);
+    SmartDashboard.putNumber("Engineering speed ", s);
+    SmartDashboard.putNumber("control signal", getMotorOutput.get());
+    SmartDashboard.putNumber("Engineering speed error", d==0?(flipNearZero=-flipNearZero):d); // trick SmartDashboard plot into thinking value is changing if 0
   }
 
-  // private void configFlywheelMotor() // TalonFX
+  // WARNING this commented out method is missing a bunch of needed stuff - mostly copy the one not commented out
+  // private void configFlywheel() // TalonFX
   // {
   //     int flywheelMotorPort=13;
   //     flywheelMotor = new TalonFX(flywheelMotorPort);
@@ -227,7 +253,11 @@ public class Robot extends TimedRobot {
 
   // }
 
-  private void configFlywheelMotor() // TalonSRXNeveRest20
+  /**
+   * Everything unique to the motor controller and gearing TalonSRX, NeveRest20 with planetary gear box and encoder
+   * Leave almost everything in native units so little conversion required
+   */
+  private void configFlywheel()
   {
       int flywheelMotorPort=0;
       flywheelMotor = new TalonSRX(flywheelMotorPort);
@@ -246,15 +276,50 @@ public class Robot extends TimedRobot {
       // flywheelMotor.setSensorPhase(false);
       flywheelMotor.setSelectedSensorPosition(0);
 
-      // NeveRest 20:1 motor/gearbox   0.2 %VBus is 60 rpm
-      RPM_per_VelocityUnit = // multiplicative factor to convert motor controller units to engineering units; for Talon it's really RPM_per_TICK_PER_100MS
+      // Talon SRX NeveRest 20:1 motor/gearbox   0.2 %VBus is 60 rpm
+      engineeringVelocityUnit = // multiplicative factor to convert motor controller units to engineering units
+      // for this Talon on a flywheel it's really RPM_per_TICK_PER_100MS
+      // for a drive train use linear velocity such as meters/second
         1./7./4. * // 1 revolution of the motor shaft per 7 encoder pulses per 4 quadrature edges per pulse
                    // (1 pulse is encoder signal A leading and trailing edges and B leading and trailing edges)
         10.      * // 100ms/sec
         60.      * // sec/min
         1./20.;    // NeveRest internal reduction gears 1 output shaft revolution per 20 motor revolutions
 
+      setFlywheelControlSignal = (speed) -> flywheelMotor.set(ControlMode.PercentOutput, speed);
+
       getFlywheelSpeed = () -> flywheelMotor.getSelectedSensorVelocity(pidIdx);
+      printSpeed = (controlSignal, speed) -> System.out.println("%VBus " + controlSignal + ", velocity (native units) " + speed + ", engineering velocity " + speed*engineeringVelocityUnit);
+      getMotorOutput = () -> flywheelMotor.getMotorOutputPercent();
+
+      printAndClearIntegrator = () ->
+        {
+          System.out.println("[Talon] get kI accum " + flywheelMotor.getIntegralAccumulator(pidIdx));
+          System.out.println("[Talon] clear kI accum " + flywheelMotor.setIntegralAccumulator(0., pidIdx, TIMEOUT_MS));
+        };
+
+      setPIDFvalues = () ->
+        {
+          // set the Talon PID constants calculated during teleop
+          flywheelMotor.selectProfileSlot(slotIdx, pidIdx);
+      
+          System.out.println("[Talon] set kF " + flywheelMotor.config_kF(0, kF[slotIdx], TIMEOUT_MS));
+          System.out.println("[Talon] set kP " + flywheelMotor.config_kP(0, kP[slotIdx], TIMEOUT_MS));
+          System.out.println("[Talon] set kI " + flywheelMotor.config_kI(0, kI[slotIdx], TIMEOUT_MS));
+          System.out.println("[Talon] set kD " + flywheelMotor.config_kD(0, kD[slotIdx], TIMEOUT_MS));
+        };
+
+      setFlywheelVelocity = (setpoint) ->
+      {
+        flywheelMotor.set(TalonSRXControlMode.Velocity, setpoint);
+        return flywheelMotor.getClosedLoopError(pidIdx);
+      };  
+
+      /*%VBus*/ controlSignalStop = 0.; // stop motor
+      /*%VBus*/ controlSignal= 0.30; // center of the tuner relay pulse %vBus for Talon FIXME
+      /*%VBus*/ oStep = 0.15; // + and - step size for the tuner controlSignal perturbation (relay)
+      /*%VBus*/ minPctVBus = 0.2; // min control signal to consider for kF
+      /*%VBus*/ maxPctVBus = 0.81; // max control signal to consider for kF
 
       //////////////////////////////////////////////////////////////////////////////////
       //            START Conversion to Talon native units
@@ -283,68 +348,74 @@ public class Robot extends TimedRobot {
       flywheelMotor.getAllConfigs(allConfigs, TIMEOUT_MS);
       System.out.println("[Talon] flywheel motor configs\n" + allConfigs);
     }
-    
-  /**
-   * 
-   * @param speed %VBus -1 to +1
-   */
-  public void setFlywheelSpeed(double speed)
-  {
-      flywheelMotor.set(ControlMode.PercentOutput, speed);
-  }
 
-  /**
-   * compute one kF assuming it's the same over the selected range.
-   * More sophistication is possible -LUT kF vs speed
-   */
-  public double computeKf()
+   /**
+    * compute one kF assuming the same (average) over the selected range.
+    * More sophistication is possible -LUT kF vs speed
+    * @param minControlSignal minimum (probably inclusive) to be considered for kF follows units of setFlywheelControlSignal()
+    * @param maxControlSignal maximum (probably not inclusive) to be considered for kF follows units of getFlywheelSpeed()
+    * @return Kf follows units setFlywheelControlSignal()/getFlywheelSpeed()
+    */
+  // if you want more precision on stepping, use int and multiply by the scale factor);
+  public double computeKf(double minControlSignal, double maxControlSignal)
   {
-    double minPctVBus = 0.2; // minimum (probably inclusive) and maximum (probably not inclusive) %VBus to be considered for kF
-    double maxPctVBus = 0.81; // if you want more precision on stepping, use int and multiply by the scale factor
-    setFlywheelSpeed(minPctVBus); // start the motor at the minimum
-    Timer.delay(1.); // wait to help stabilize at minimum speed starting from 0, we are hopeful, more wait below
-    // get velocity many times at each of several %VBus and least squares fit them all
-    for(double rampPctVBus = minPctVBus; rampPctVBus < maxPctVBus; rampPctVBus+=0.05)
+    RunningRegression speedFuncOfControlSignal = new RunningRegression(); // construct regression object used for calculating kF
+    RunningRegression controlSignalFuncOfSpeed = new RunningRegression(); // construct regression object used for calculating kF
+    double speed = 0;
+
+    setFlywheelControlSignal.accept(minControlSignal); // start the motor at the minimum
+    Timer.delay(1.); // wait to help stabilize at minimum speed, more waiting below
+    // get velocity many times at each of several control signals and least squares fit them all
+    for(double controlSignal = minControlSignal; controlSignal < maxControlSignal; controlSignal+=0.05)
     {
-      setFlywheelSpeed(rampPctVBus);
+      setFlywheelControlSignal.accept(controlSignal);
       Timer.delay(3.); // wait to stabilize speed, we are hopeful
       for(int countSamplesAtPctVBus = 1; countSamplesAtPctVBus <= 500; countSamplesAtPctVBus++)
       {
-        aLine.Push(rampPctVBus, getFlywheelSpeed.get());
+        speed = getFlywheelSpeed.get();
+        speedFuncOfControlSignal.Push(controlSignal, speed);
+        controlSignalFuncOfSpeed.Push(speed, controlSignal);
         Timer.delay((double)sampleTime/1000.);
       }
-      System.out.println("%VBus " + rampPctVBus + ", velocity (native units) " + getFlywheelSpeed.get() + ", velocity RPM " + getFlywheelSpeed.get()*RPM_per_VelocityUnit);
+      printSpeed.accept(controlSignal, speed);
     }
-    var kF = 1023./aLine.Slope(); // kF in native units related to %VBus/velocity units
-    System.out.println("full kF = " + kF);
-    return kF;
+
+    System.out.println("control signal = f(speed)\n" + controlSignalFuncOfSpeed.toString());
+
+    return 1./speedFuncOfControlSignal.Slope(); // kF inverse velocity units/control signal
   }
 
-  public void stabilizeInitialSpeed() 
+  /**
+   * lingers at a setpoint to stabilize the motor at that speed
+   * used to start tuning at a stable center velocity
+   * 
+   * Units are neutral
+   * @param controlSignal follows units of setFlywheelControlSignal()
+   * @return follows units of getFlywheelSpeed()
+   */
+  public double stabilizeInitialSpeed(double controlSignal) 
   {
-    // start tuning at the center velocity
-    // Tuned with %VBus/velocity units of gearbox shaft output
-    setFlywheelSpeed(output);
+    setFlywheelControlSignal.accept(controlSignal);
 
     try {Thread.sleep(5000);} // let motor speed stabilize
         catch (InterruptedException e) {e.printStackTrace();}
 
-    //get the (average) speed (setpoint or input) at this output (power level)
+    //get the (average) speed at this control signal
     int numSamples = 20;
-    setpoint = 0;
+    double averageSpeed = 0;
+
     for(int idx =1; idx <=numSamples; idx++)
     {
         var speed = getFlywheelSpeed.get();
-        setpoint += speed;
-        System.out.println("speed " + speed + " " + setpoint);
+        averageSpeed += speed;
+        System.out.println("speed " + speed + " " + averageSpeed);
         try {Thread.sleep(100);} // let motor speed stabilize
           catch (InterruptedException e) {e.printStackTrace();}
     }
 
-    setpoint /= (double)numSamples; // average of the speed
+    averageSpeed /= (double)numSamples; // average of the speed
     
-    System.out.println(" power level %VBus " + output + ", power level step +- " + oStep
-      + ", Native Velocity " + setpoint + ", RPM " + setpoint*RPM_per_VelocityUnit);
+    return averageSpeed;
   }
 }
 /*
@@ -379,15 +450,19 @@ Cap on the integral accumulator in sensor units. Note accumulator is multiplied 
 takes effect.
 Peak
 
-OLD EXAMPLE
+EXAMPLE
+
+NOTE THAT THE FIRST RUN IN AUTONOMOUS TO USER THE PIDF VALUES HAS A DISPLAY OF THE MOTOR VELOCITY RUNNING BUT IT ISN"T ACTUALLY RUNNING
 
 ********** Robot program starting **********
+NT: server: client CONNECTED: 10.42.37.5 port 60672
 [Talon] set factory default OK
 [Talon] set vel period OK
 [Talon] set vel window OK
 [Talon] set feedback sensor FeedbackDevice.QuadEncoder OK
 [Talon] set nominal output reverse OK
-NT: server: client CONNECTED: 10.42.37.5 port 55455
+[Talon] set status 2 OK
+[Talon] set status 13 OK
 [Talon] flywheel motor configs
 .peakCurrentLimit = 1;
 .peakCurrentDuration = 1;
@@ -419,6 +494,7 @@ NT: server: client CONNECTED: 10.42.37.5 port 55455
 .velocityMeasurementWindow = 1;
 .forwardSoftLimitThreshold = 0.0;
 .reverseSoftLimitThreshold = 0.0;
+Loop time of 0.005s overrun
 .forwardSoftLimitEnable = false;
 .reverseSoftLimitEnable = false;
 .slot0.kP = 0.0;
@@ -481,319 +557,445 @@ NT: server: client CONNECTED: 10.42.37.5 port 55455
 ********** Robot program startup complete **********
 [Talon] get kI accum 0.0
 [Talon] clear kI accum OK
-%VBus 0.2, velocity (native units) 56.0, velocity RPM 60.0
-%VBus 0.25, velocity (native units) 68.0, velocity RPM 72.85714285714286
-%VBus 0.3, velocity (native units) 84.0, velocity RPM 90.0
-%VBus 0.35, velocity (native units) 100.0, velocity RPM 107.14285714285714
-%VBus 0.39999999999999997, velocity (native units) 112.0, velocity RPM 120.0
-%VBus 0.44999999999999996, velocity (native units) 132.0, velocity RPM 141.42857142857142
-%VBus 0.49999999999999994, velocity (native units) 144.0, velocity RPM 154.28571428571428
-%VBus 0.5499999999999999, velocity (native units) 160.0, velocity RPM 171.42857142857142
-%VBus 0.6, velocity (native units) 176.0, velocity RPM 188.57142857142856
-%VBus 0.65, velocity (native units) 196.0, velocity RPM 210.0
-%VBus 0.7000000000000001, velocity (native units) 208.0, velocity RPM 222.85714285714286
-%VBus 0.7500000000000001, velocity (native units) 224.0, velocity RPM 240.0
-%VBus 0.8000000000000002, velocity (native units) 240.0, velocity RPM 257.1428571428571
-kF = 3.3127955406632568
-speed 84.0 84.0
-speed 88.0 172.0
-speed 88.0 260.0
-speed 88.0 348.0
-speed 88.0 436.0
-speed 84.0 520.0
-speed 84.0 604.0
-speed 84.0 688.0
-speed 84.0 772.0
-speed 84.0 856.0
-speed 84.0 940.0
-speed 84.0 1024.0
-speed 84.0 1108.0
-speed 88.0 1196.0
-speed 88.0 1284.0
-speed 84.0 1368.0
-speed 84.0 1452.0
-speed 88.0 1540.0
-speed 88.0 1628.0
-speed 84.0 1712.0
-power level %VBus 0.3, power level step +- 0.15, Native Velocity 85.6, RPM 91.71428571428571
-[Time msecs] [PV chart min, value, max] ~~~~~~~~~ [Controller chart, min, value, max]
-teleopPeriodic(): 0.020187s
-SmartDashboard.updateValues(): 0.000013s
-robotPeriodic(): 0.000226s
-LiveWindow.updateValues(): 0.000068s
-Shuffleboard.update(): 0.000007s
-teleopInit(): 80.826877s
-2 83.200 88.000 88.000 . . . . . + . . . . | ~ | . . . . + . . . . . 0.150 0.150 0.450Warning at edu.wpi.first.wpilibj.Tracer.lambda$printEpochs$0(Tracer.java:63): teleopPeriodic(): 0.020187s
-SmartDashboard.updateValues(): 0.000013s
-robotPeriodic(): 0.000226s
-LiveWindow.updateValues(): 0.000068s
-Shuffleboard.update(): 0.000007s
-teleopInit(): 80.826877s
+Warning at edu.wpi.first.wpilibj.IterativeRobotBase.printLoopOverrunMessage(IterativeRobotBase.java:359): Loop time of 0.005s overrun
+Default disabledPeriodic() method... Override me!
+Default robotPeriodic() method... Override me!
+SmartDashboard.updateValues(): 0.039240s
+disabledInit(): 0.038865s
+robotPeriodic(): 0.000316s
+LiveWindow.updateValues(): 0.000091s
+Shuffleboard.update(): 0.008907s
+disabledPeriodic(): 0.012961s
+Warning at edu.wpi.first.wpilibj.Tracer.lambda$printEpochs$0(Tracer.java:63): SmartDashboard.updateValues(): 0.039240s
+disabledInit(): 0.038865s
+robotPeriodic(): 0.000316s
+LiveWindow.updateValues(): 0.000091s
+Shuffleboard.update(): 0.008907s
+disabledPeriodic(): 0.012961s
+[phoenix] Library initialization is complete.
+[phoenix-diagnostics] Server 1.9.0 (Jan 4 2022,20:28:13) running on port: 1250
 Loop time of 0.005s overrun
 Warning at edu.wpi.first.wpilibj.IterativeRobotBase.printLoopOverrunMessage(IterativeRobotBase.java:359): Loop time of 0.005s overrun
-65 44.000 44.000 127.200 | . . . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-71 44.000 44.000 127.200 | . . . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-78 44.000 52.000 127.200 . | . . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-91 44.000 72.000 127.200 . . . .|. + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-122 44.000 124.000 127.200 . . . . . + . . . .|. ~ | . . . . + . . . . . 0.150 0.150 0.450
-132 43.200 128.000 128.000 . . . . . + . . . . | ~ | . . . . + . . . . . 0.150 0.150 0.450
-147 43.200 112.000 128.000 . . . . . + . . | . . ~ | . . . . + . . . . . 0.150 0.150 0.450
-159 43.200 72.000 128.000 . . . .|. + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-169 43.200 56.000 128.000 . .|. . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-185 43.200 68.000 128.000 . . . | . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-196 43.200 96.000 128.000 . . . . . + | . . . . ~ | . . . . + . . . . . 0.150 0.150 0.450
-206 43.200 116.000 128.000 . . . . . + . . .|. . ~ | . . . . + . . . . . 0.150 0.150 0.450
-218 43.200 116.000 128.000 . . . . . + . . .|. . ~ | . . . . + . . . . . 0.150 0.150 0.450
-230 43.200 96.000 128.000 . . . . . + | . . . . ~ | . . . . + . . . . . 0.150 0.150 0.450
-242 43.200 72.000 128.000 . . . .|. + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-257 43.200 56.000 128.000 . .|. . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-267 43.200 64.000 128.000 . . .|. . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-278 43.200 104.000 128.000 . . . . . + . | . . . ~ | . . . . + . . . . . 0.150 0.150 0.450
-293 43.200 120.000 128.000 . . . . . + . . . | . ~ | . . . . + . . . . . 0.150 0.150 0.450
-310 43.200 96.000 128.000 . . . . . + | . . . . ~ | . . . . + . . . . . 0.150 0.150 0.450 peaks 293-206, Ku=0.00455, Pu=0.08700, Kp=0.00273, Ki=0.06272, Kd=0.00003 %VBus/velocity
-[Talon] PID 0, Kp = 2.7911229734230094, Ki = 0.06416374651547149, Kd = 30.353462335975227, kF = 3.3127955406632568
-322 43.200 68.000 128.000 . . . | . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-400 43.200 48.000 128.000 .|. . . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-412 43.200 72.000 128.000 . . . .|. + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-421 43.200 100.000 128.000 . . . . . + .|. . . . ~ | . . . . + . . . . . 0.150 0.150 0.450
-432 43.200 116.000 128.000 . . . . . + . . .|. . ~ | . . . . + . . . . . 0.150 0.150 0.450
-439 43.200 116.000 128.000 . . . . . + . . .|. . ~ | . . . . + . . . . . 0.150 0.150 0.450 peaks 432-293, Ku=0.00455, Pu=0.13900, Kp=0.00273, Ki=0.03926, Kd=0.00005 %VBus/velocity
-[Talon] PID 0, Kp = 2.7911229734230094, Ki = 0.040160042783064884, Kd = 48.4957616632248, kF = 3.3127955406632568
-450 43.200 92.000 128.000 . . . . . +|. . . . . ~ | . . . . + . . . . . 0.150 0.150 0.450
-509 43.200 44.000 128.000 | . . . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-516 40.000 40.000 131.200 | . . . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-529 40.000 52.000 131.200 . .|. . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-534 40.000 52.000 131.200 . .|. . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-551 40.000 108.000 131.200 . . . . . + . .|. . . ~ | . . . . + . . . . . 0.150 0.150 0.450
-567 40.000 120.000 131.200 . . . . . + . . . | . ~ | . . . . + . . . . . 0.150 0.150 0.450
-577 40.000 108.000 131.200 . . . . . + . .|. . . ~ | . . . . + . . . . . 0.150 0.150 0.450 peaks 567-432, Ku=0.00434, Pu=0.13500, Kp=0.00260, Ki=0.03858, Kd=0.00004 %VBus/velocity
-[Talon] PID 0, Kp = 2.664253747358328, Ki = 0.03947042588679005, Kd = 44.95928198667179, kF = 3.3127955406632568
-589 40.000 68.000 131.200 . . . | . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-626 40.000 44.000 131.200 .|. . . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-644 40.000 64.000 131.200 . . .|. . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-649 40.000 76.000 131.200 . . . . | + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-655 40.000 92.000 131.200 . . . . . +|. . . . . ~ | . . . . + . . . . . 0.150 0.150 0.450
-660 40.000 104.000 131.200 . . . . . + . | . . . ~ | . . . . + . . . . . 0.150 0.150 0.450
-665 40.000 104.000 131.200 . . . . . + . | . . . ~ | . . . . + . . . . . 0.150 0.150 0.450
-670 40.000 116.000 131.200 . . . . . + . . .|. . ~ | . . . . + . . . . . 0.150 0.150 0.450
-676 40.000 120.000 131.200 . . . . . + . . . | . ~ | . . . . + . . . . . 0.150 0.150 0.450
-681 40.000 116.000 131.200 . . . . . + . . .|. . ~ | . . . . + . . . . . 0.150 0.150 0.450 peaks 676-567, Ku=0.00434, Pu=0.10900, Kp=0.00260, Ki=0.04779, Kd=0.00004 %VBus/velocity
-[Talon] PID 0, Kp = 2.664253747358328, Ki = 0.04888538985978584, Kd = 36.30045730775722, kF = 3.3127955406632568
-689 40.000 96.000 131.200 . . . . . + | . . . . ~ | . . . . + . . . . . 0.150 0.150 0.450
-706 40.000 60.000 131.200 . . | . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-711 40.000 52.000 131.200 . .|. . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-717 40.000 48.000 131.200 . | . . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-723 40.000 48.000 131.200 . | . . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-728 40.000 52.000 131.200 . .|. . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-733 40.000 64.000 131.200 . . .|. . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-740 40.000 76.000 131.200 . . . . | + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-745 40.000 88.000 131.200 . . . . . | . . . . . ~ | . . . . + . . . . . 0.150 0.150 0.450
-756 40.000 108.000 131.200 . . . . . + . .|. . . ~ | . . . . + . . . . . 0.150 0.150 0.450
-772 40.000 116.000 131.200 . . . . . + . . .|. . ~ | . . . . + . . . . . 0.150 0.150 0.450
-779 40.000 104.000 131.200 . . . . . + . | . . . ~ | . . . . + . . . . . 0.150 0.150 0.450 peaks 772-676, Ku=0.00434, Pu=0.09600, Kp=0.00260, Ki=0.05426, Kd=0.00003 %VBus/velocity
-[Talon] PID 0, Kp = 2.664253747358328, Ki = 0.0555052864032985, Kd = 31.97104496829994, kF = 3.3127955406632568
-784 40.000 84.000 131.200 . . . . . | . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-801 40.000 56.000 131.200 . .|. . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-806 40.000 52.000 131.200 . .|. . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-815 40.000 68.000 131.200 . . . | . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-820 40.000 84.000 131.200 . . . . . | . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
-829 40.000 104.000 131.200 . . . . . + . | . . . ~ | . . . . + . . . . . 0.150 0.150 0.450
-836 40.000 116.000 131.200 . . . . . + . . .|. . ~ | . . . . + . . . . . 0.150 0.150 0.450
-844 40.000 120.000 131.200 . . . . . + . . . | . ~ | . . . . + . . . . . 0.150 0.150 0.450
-849 40.000 120.000 131.200 . . . . . + . . . | . ~ | . . . . + . . . . . 0.150 0.150 0.450 peaks 844-772, Ku=0.00434, Pu=0.07200, Kp=0.00260, Ki=0.07234, Kd=0.00002 %VBus/velocity
-[Talon] PID 0, Kp = 2.664253747358328, Ki = 0.07400704853773134, Kd = 23.97828372622495, kF = 3.3127955406632568
-855 40.000 108.000 131.200 . . . . . + . .|. . . ~ | . . . . + . . . . . 0.150 0.150 0.450
-DISABLE TELEOP
+SmartDashboard.updateValues(): 0.001042s
+robotPeriodic(): 0.002397s
+LiveWindow.updateValues(): 0.000532s
+Shuffleboard.update(): 0.002631s
+disabledPeriodic(): 0.001251s
+Warning at edu.wpi.first.wpilibj.Tracer.lambda$printEpochs$0(Tracer.java:63): SmartDashboard.updateValues(): 0.001042s
+robotPeriodic(): 0.002397s
+LiveWindow.updateValues(): 0.000532s
+Shuffleboard.update(): 0.002631s
+disabledPeriodic(): 0.001251s
+Loop time of 0.005s overrun
+Warning at edu.wpi.first.wpilibj.IterativeRobotBase.printLoopOverrunMessage(IterativeRobotBase.java:359): Loop time of 0.005s overrun
+SmartDashboard.updateValues(): 0.000009s
+robotPeriodic(): 0.000008s
+LiveWindow.updateValues(): 0.000005s
+Shuffleboard.update(): 0.007566s
+disabledPeriodic(): 0.000091s
+Warning at edu.wpi.first.wpilibj.Tracer.lambda$printEpochs$0(Tracer.java:63): SmartDashboard.updateValues(): 0.000009s
+robotPeriodic(): 0.000008s
+LiveWindow.updateValues(): 0.000005s
+Shuffleboard.update(): 0.007566s
+disabledPeriodic(): 0.000091s
+Start auto tuning PIDF
+Start computing kF
+Loop time of 0.005s overrun
+Warning at edu.wpi.first.wpilibj.IterativeRobotBase.printLoopOverrunMessage(IterativeRobotBase.java:359): Loop time of 0.005s overrun
+%VBus 0.2, velocity (native units) 52.0, engineering velocity 55.714285714285715
+%VBus 0.25, velocity (native units) 68.0, engineering velocity 72.85714285714286
+%VBus 0.3, velocity (native units) 84.0, engineering velocity 90.0
+%VBus 0.35, velocity (native units) 100.0, engineering velocity 107.14285714285714
+%VBus 0.39999999999999997, velocity (native units) 116.0, engineering velocity 124.28571428571428
+%VBus 0.44999999999999996, velocity (native units) 132.0, engineering velocity 141.42857142857142
+%VBus 0.49999999999999994, velocity (native units) 144.0, engineering velocity 154.28571428571428
+%VBus 0.5499999999999999, velocity (native units) 160.0, engineering velocity 171.42857142857142
+%VBus 0.6, velocity (native units) 176.0, engineering velocity 188.57142857142856
+%VBus 0.65, velocity (native units) 192.0, engineering velocity 205.71428571428572
+%VBus 0.7000000000000001, velocity (native units) 208.0, engineering velocity 222.85714285714286
+%VBus 0.7500000000000001, velocity (native units) 220.0, engineering velocity 235.7142857142857
+%VBus 0.8000000000000002, velocity (native units) 240.0, engineering velocity 257.1428571428571
+control signal = f(speed)
+NumDataValues: 6500
+y = A + Bx ==> y = 0.0189338 +0.00330927x
+Slope: 0.003309
+Intercept: 0.018934
+r^2 Correlation: 0.999415
+Stabilize tuning center speed
+speed 84.0 84.0
+speed 84.0 168.0
+speed 84.0 252.0
+speed 84.0 336.0
+speed 84.0 420.0
+speed 84.0 504.0
+speed 84.0 588.0
+speed 84.0 672.0
+speed 80.0 752.0
+speed 84.0 836.0
+speed 84.0 920.0
+speed 84.0 1004.0
+speed 84.0 1088.0
+speed 84.0 1172.0
+speed 84.0 1256.0
+speed 84.0 1340.0
+speed 84.0 1424.0
+speed 84.0 1508.0
+speed 84.0 1592.0
+speed 84.0 1676.0
+control signal 0.3, control signal step +- 0.15, average velocity 83.8
+[Time msecs] [PV chart min, value, max] ~~~~~~~~~ [Controller chart, min, value, max]
+Activate relay stepping
+teleopPeriodic(): 0.023546s
+SmartDashboard.updateValues(): 0.000013s
+robotPeriodic(): 0.000301s
+LiveWindow.updateValues(): 0.000006s
+Shuffleboard.update(): 0.000006s
+teleopInit(): 80.887824s
+2 83.600 84.000 84.000 . . . . . + . . . . | ~ . . . . . + . . . . | 0.150 0.450 0.450Warning at edu.wpi.first.wpilibj.Tracer.lambda$printEpochs$0(Tracer.java:63): teleopPeriodic(): 0.023546s
+SmartDashboard.updateValues(): 0.000013s
+robotPeriodic(): 0.000301s
+LiveWindow.updateValues(): 0.000006s
+Shuffleboard.update(): 0.000006s
+teleopInit(): 80.887824s
+Loop time of 0.005s overrun
+68 43.600 124.000 124.000 . . . . . + . . . . | ~ | . . . . + . . . . . 0.150 0.150 0.450Warning at edu.wpi.first.wpilibj.IterativeRobotBase.printLoopOverrunMessage(IterativeRobotBase.java:359): Loop time of 0.005s overrun
+73 43.600 124.000 124.000 . . . . . + . . . . | ~ | . . . . + . . . . . 0.150 0.150 0.450
+78 39.600 128.000 128.000 . . . . . + . . . . | ~ | . . . . + . . . . . 0.150 0.150 0.450
+83 39.600 128.000 128.000 . . . . . + . . . . | ~ | . . . . + . . . . . 0.150 0.150 0.450
+88 39.600 120.000 128.000 . . . . . + . . . | . ~ | . . . . + . . . . . 0.150 0.150 0.450
+102 39.600 92.000 128.000 . . . . . + | . . . . ~ | . . . . + . . . . . 0.150 0.150 0.450
+115 39.600 64.000 128.000 . . . | . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+129 39.600 52.000 128.000 . .|. . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+149 39.600 84.000 128.000 . . . . . | . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+168 39.600 112.000 128.000 . . . . . + . . | . . ~ | . . . . + . . . . . 0.150 0.150 0.450
+186 39.600 120.000 128.000 . . . . . + . . . | . ~ | . . . . + . . . . . 0.150 0.150 0.450
+198 39.600 88.000 128.000 . . . . . +|. . . . . ~ | . . . . + . . . . . 0.150 0.150 0.450
+220 39.600 60.000 128.000 . . .|. . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+240 39.600 60.000 128.000 . . .|. . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+260 39.600 108.000 128.000 . . . . . + . .|. . . ~ | . . . . + . . . . . 0.150 0.150 0.450
+279 39.600 108.000 128.000 . . . . . + . .|. . . ~ | . . . . + . . . . . 0.150 0.150 0.450
+298 39.600 68.000 128.000 . . . | . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450 peaks 260-186, Ku=0.00503, Pu=0.07400, Kp=0.00302, Ki=0.08150, Kd=0.00003
+[PIDF] 0, Kp = 3.0849253916780643, Ki = 0.083376361937245, Kd = 28.53555987302209, kF = 3.3893510306440726
+318 39.600 64.000 128.000 . . . | . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+384 35.600 132.000 132.000 . . . . . + . . . . | ~ | . . . . + . . . . . 0.150 0.150 0.450
+389 35.600 128.000 132.000 . . . . . + . . . .|. ~ | . . . . + . . . . . 0.150 0.150 0.450
+394 35.600 132.000 132.000 . . . . . + . . . . | ~ | . . . . + . . . . . 0.150 0.150 0.450
+399 35.600 124.000 132.000 . . . . . + . . . .|. ~ | . . . . + . . . . . 0.150 0.150 0.450
+404 35.600 124.000 132.000 . . . . . + . . . .|. ~ | . . . . + . . . . . 0.150 0.150 0.450
+409 35.600 112.000 132.000 . . . . . + . . | . . ~ | . . . . + . . . . . 0.150 0.150 0.450
+424 35.600 80.000 132.000 . . . . .|+ . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+445 35.600 56.000 132.000 . . | . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+465 35.600 96.000 132.000 . . . . . + | . . . . ~ | . . . . + . . . . . 0.150 0.150 0.450
+489 35.600 112.000 132.000 . . . . . + . . | . . ~ | . . . . + . . . . . 0.150 0.150 0.450
+512 35.600 68.000 132.000 . . . .|. + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+525 35.600 52.000 132.000 . .|. . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+558 35.600 104.000 132.000 . . . . . + . | . . . ~ | . . . . + . . . . . 0.150 0.150 0.450
+584 35.600 100.000 132.000 . . . . . + .|. . . . ~ | . . . . + . . . . . 0.150 0.150 0.450
+603 35.600 60.000 132.000 . . .|. . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+614 35.600 52.000 132.000 . .|. . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+636 35.600 68.000 132.000 . . . .|. + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+655 35.600 112.000 132.000 . . . . . + . . | . . ~ | . . . . + . . . . . 0.150 0.150 0.450
+675 35.600 120.000 132.000 . . . . . + . . . | . ~ | . . . . + . . . . . 0.150 0.150 0.450
+691 35.600 88.000 132.000 . . . . . +|. . . . . ~ | . . . . + . . . . . 0.150 0.150 0.450 peaks 675-489, Ku=0.00477, Pu=0.18600, Kp=0.00286, Ki=0.03080, Kd=0.00007
+[PIDF] 0, Kp = 2.9306791220941606, Ki = 0.03151267873219527, Kd = 68.13828958868923, kF = 3.3893510306440726
+697 35.600 76.000 132.000 . . . . .|+ . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+722 35.600 48.000 132.000 . | . . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+727 35.600 48.000 132.000 . | . . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+732 35.600 48.000 132.000 . | . . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+746 35.600 72.000 132.000 . . . . | + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+751 35.600 84.000 132.000 . . . . . | . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+766 35.600 112.000 132.000 . . . . . + . . | . . ~ | . . . . + . . . . . 0.150 0.150 0.450
+771 35.600 116.000 132.000 . . . . . + . . .|. . ~ | . . . . + . . . . . 0.150 0.150 0.450
+782 35.600 124.000 132.000 . . . . . + . . . .|. ~ | . . . . + . . . . . 0.150 0.150 0.450
+787 35.600 120.000 132.000 . . . . . + . . . | . ~ | . . . . + . . . . . 0.150 0.150 0.450
+792 35.600 116.000 132.000 . . . . . + . . .|. . ~ | . . . . + . . . . . 0.150 0.150 0.450 peaks 782-675, Ku=0.00455, Pu=0.10700, Kp=0.00273, Ki=0.05100, Kd=0.00004
+[PIDF] 0, Kp = 2.7911229734230094, Ki = 0.05217052286771981, Kd = 37.33126976953276, kF = 3.3893510306440726
+805 35.600 76.000 132.000 . . . . .|+ . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+824 35.600 56.000 132.000 . . | . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+829 35.600 52.000 132.000 . .|. . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+835 35.600 56.000 132.000 . . | . . + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+846 35.600 72.000 132.000 . . . . | + . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+852 35.600 84.000 132.000 . . . . . | . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450
+880 35.600 120.000 132.000 . . . . . + . . . | . ~ | . . . . + . . . . . 0.150 0.150 0.450
+888 35.600 128.000 132.000 . . . . . + . . . .|. ~ | . . . . + . . . . . 0.150 0.150 0.450
+906 35.600 108.000 132.000 . . . . . + . .|. . . ~ | . . . . + . . . . . 0.150 0.150 0.450 peaks 888-782, Ku=0.00455, Pu=0.10600, Kp=0.00273, Ki=0.05148, Kd=0.00004
+[PIDF] 0, Kp = 2.7911229734230094, Ki = 0.0526626976117549, Kd = 36.98237939785488, kF = 3.3893510306440726
+Loop time of 0.005s overrun
+teleopPeriodic(): 0.004915s
+SmartDashboard.updateValues(): 0.000012s
+robotPeriodic(): 0.000009s
+LiveWindow.updateValues(): 0.000005s
+Shuffleboard.update(): 0.000006s
+915 35.600 80.000 132.000 . . . . .|+ . . . . . ~ . . . . . + . . . . | 0.150 0.450 0.450Warning at edu.wpi.first.wpilibj.IterativeRobotBase.printLoopOverrunMessage(IterativeRobotBase.java:359): Loop time of 0.005s overrun
+Warning at edu.wpi.first.wpilibj.Tracer.lambda$printEpochs$0(Tracer.java:63): teleopPeriodic(): 0.004915s
+SmartDashboard.updateValues(): 0.000012s
+robotPeriodic(): 0.000009s
+LiveWindow.updateValues(): 0.000005s
+Shuffleboard.update(): 0.000006s
+Loop time of 0.005s overrun
+Warning at edu.wpi.first.wpilibj.IterativeRobotBase.printLoopOverrunMessage(IterativeRobotBase.java:359): Loop time of 0.005s overrun
+teleopPeriodic(): 0.000066s
+SmartDashboard.updateValues(): 0.007403s
+robotPeriodic(): 0.000006s
+LiveWindow.updateValues(): 0.000316s
+Shuffleboard.update(): 0.000008s
+   from: edu.wpi.first.wpilibj.Tracer.lambda$printEpochs$0(Tracer.java:63)
 
+Warning at edu.wpi.first.wpilibj.Tracer.lambda$printEpochs$0(Tracer.java:63): teleopPeriodic(): 0.000066s
+SmartDashboard.updateValues(): 0.007403s
+robotPeriodic(): 0.000006s
+LiveWindow.updateValues(): 0.000316s
+Shuffleboard.update(): 0.000008s
 [Talon] get kI accum 0.0
 [Talon] clear kI accum OK
-
-ENABLE AUTONOMOUS
-
+Loop time of 0.005s overrun
+Warning at edu.wpi.first.wpilibj.IterativeRobotBase.printLoopOverrunMessage(IterativeRobotBase.java:359): Loop time of 0.005s overrun
+SmartDashboard.updateValues(): 0.000009s
+robotPeriodic(): 0.000007s
+LiveWindow.updateValues(): 0.006767s
+Shuffleboard.update(): 0.000027s
+disabledPeriodic(): 0.000070s
+Warning at edu.wpi.first.wpilibj.Tracer.lambda$printEpochs$0(Tracer.java:63): SmartDashboard.updateValues(): 0.000009s
+robotPeriodic(): 0.000007s
+LiveWindow.updateValues(): 0.006767s
+Shuffleboard.update(): 0.000027s
+disabledPeriodic(): 0.000070s
+Loop time of 0.005s overrun
 [Talon] set kF OK
+Warning at edu.wpi.first.wpilibj.IterativeRobotBase.printLoopOverrunMessage(IterativeRobotBase.java:359): Loop time of 0.005s overrun
 [Talon] set kP OK
 [Talon] set kI OK
 [Talon] set kD OK
-setpoint RPM 91.71428571428571, actual RPM 0.0, error RPM 0.0
-setpoint RPM 91.71428571428571, actual RPM 102.85714285714286, error RPM 0.0
-setpoint RPM 91.71428571428571, actual RPM 102.85714285714286, error RPM 0.0
-setpoint RPM 91.71428571428571, actual RPM 102.85714285714286, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 102.85714285714286, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 98.57142857142857, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 98.57142857142857, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 98.57142857142857, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 98.57142857142857, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -11.785714285714285
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM 1.0714285714285714
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 94.28571428571428, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
-setpoint RPM 91.71428571428571, actual RPM 90.0, error RPM -3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 0.0, error 1.0714285714285714
+autonomousInit(): 0.040275s
+SmartDashboard.updateValues(): 0.000013s
+robotPeriodic(): 0.000708s
+LiveWindow.updateValues(): 0.000005s
+Shuffleboard.update(): 0.000007s
+autonomousPeriodic(): 0.058868s
+Warning at edu.wpi.first.wpilibj.Tracer.lambda$printEpochs$0(Tracer.java:63): autonomousInit(): 0.040275s
+SmartDashboard.updateValues(): 0.000013s
+robotPeriodic(): 0.000708s
+LiveWindow.updateValues(): 0.000005s
+Shuffleboard.update(): 0.000007s
+autonomousPeriodic(): 0.058868s
 
-DISABLE AUTONOMOUS
+DISABLE
 
-[Talon] get kI accum 522.0
+ENABLE AUTONOMOUS
+
+Engineering: setpoint 89.78571428571428, actual 98.57142857142857, error -13.928571428571429
+Engineering: setpoint 89.78571428571428, actual 98.57142857142857, error -9.642857142857142
+Engineering: setpoint 89.78571428571428, actual 98.57142857142857, error -9.642857142857142
+Engineering: setpoint 89.78571428571428, actual 98.57142857142857, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 98.57142857142857, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 98.57142857142857, error -9.642857142857142
+Engineering: setpoint 89.78571428571428, actual 98.57142857142857, error -9.642857142857142
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -9.642857142857142
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -9.642857142857142
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 90.0, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 90.0, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 90.0, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 94.28571428571428, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 90.0, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 90.0, error -5.357142857142857
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 90.0, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error -1.0714285714285714
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 85.71428571428571, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error 3.2142857142857144
+Engineering: setpoint 89.78571428571428, actual 90.0, error 3.2142857142857144
+[Talon] get kI accum 330.0
 [Talon] clear kI accum OK
-
+Loop time of 0.005s overrun
+Warning at edu.wpi.first.wpilibj.IterativeRobotBase.printLoopOverrunMessage(IterativeRobotBase.java:359): Loop time of 0.005s overrun
+SmartDashboard.updateValues(): 0.000009s
+robotPeriodic(): 0.000008s
+LiveWindow.updateValues(): 0.006429s
+Shuffleboard.update(): 0.000025s
+disabledPeriodic(): 0.000079s
+Warning at edu.wpi.first.wpilibj.Tracer.lambda$printEpochs$0(Tracer.java:63): SmartDashboard.updateValues(): 0.000009s
+robotPeriodic(): 0.000008s
+LiveWindow.updateValues(): 0.006429s
+Shuffleboard.update(): 0.000025s
+disabledPeriodic(): 0.000079s
+DISABLE AUTONOMOUS
 
 */
 
